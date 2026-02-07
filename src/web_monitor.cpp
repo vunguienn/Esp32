@@ -5,7 +5,7 @@
 #include "web_monitor.h"
 #include "mqtt_handler.h"
 #include "system_watchdog.h"
-#include "dashboard_html.h"
+#include "dashboard_html_v3.h"
 #include <LittleFS.h>
 
 // Use LittleFS alias
@@ -40,12 +40,14 @@ void WebMonitor::begin(uint16_t port) {
     _server->on("/", HTTP_GET, [this]() { handleRoot(); });
     _server->on("/api/status", HTTP_GET, [this]() { handleApiStatus(); });
     _server->on("/api/sensors", HTTP_GET, [this]() { handleApiSensors(); });
+    _server->on("/api/sensors/mock", HTTP_POST, [this]() { handleApiSensorMock(); });
     _server->on("/api/relays", HTTP_GET, [this]() { handleApiRelays(); });
     _server->on("/api/relay/toggle", HTTP_POST, [this]() { handleApiRelayToggle(); });
     _server->on("/api/inputs", HTTP_GET, [this]() { handleApiInputs(); });
     _server->on("/api/automation", HTTP_GET, [this]() { handleApiAutomation(); });
     _server->on("/api/automation/full", HTTP_GET, [this]() { handleApiAutomationFull(); });
     _server->on("/api/automation/check", HTTP_GET, [this]() { handleApiAutomationCheck(); });
+    _server->on("/api/lifecycle", HTTP_POST, [this]() { handleApiLifecycleSet(); });
     _server->on("/api/system", HTTP_GET, [this]() { handleApiSystem(); });
     _server->on("/api/watchdog", HTTP_GET, [this]() { handleApiWatchdog(); });
     _server->on("/api/watchdog/reset", HTTP_POST, [this]() { handleApiWatchdogReset(); });
@@ -87,6 +89,9 @@ void WebMonitor::setRelayController(RelayController* relays) {
 }
 
 void WebMonitor::updateSensorData(const SensorReadings& readings) {
+    if (automationSync.isSensorOverrideEnabled()) {
+        return;
+    }
     _cachedReadings = readings;
 }
 
@@ -159,6 +164,7 @@ void WebMonitor::handleApiSensors() {
     doc["waterLevel"] = _cachedReadings.waterLevel;
     doc["valid"] = _cachedReadings.valid;
     doc["timestamp"] = _cachedReadings.timestamp;
+    doc["mockEnabled"] = automationSync.isSensorOverrideEnabled();
     
     // Targets
     JsonObject targets = doc["targets"].to<JsonObject>();
@@ -173,6 +179,51 @@ void WebMonitor::handleApiSensors() {
     _server->send(200, getJsonContentType(), output);
 }
 
+void WebMonitor::handleApiSensorMock() {
+    JsonDocument doc;
+    JsonDocument resp;
+
+    String body = _server->arg("plain");
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        resp["ok"] = false;
+        resp["message"] = "Invalid JSON";
+        String output;
+        serializeJson(resp, output);
+        _server->send(400, getJsonContentType(), output);
+        return;
+    }
+
+    bool enabled = doc["enabled"] | false;
+    if (enabled) {
+        float temp = doc["temperature"] | _cachedReadings.temperature;
+        float humi = doc["humidity"] | _cachedReadings.humidity;
+        float co2 = doc["co2"] | _cachedReadings.co2;
+        float vpd = doc["vpd"] | _cachedReadings.vpd;
+
+        automationSync.setSensorOverride(temp, humi, co2, vpd);
+        _cachedReadings.temperature = temp;
+        _cachedReadings.humidity = humi;
+        _cachedReadings.co2 = (int)co2;
+        _cachedReadings.vpd = vpd;
+        _cachedReadings.valid = true;
+        _cachedReadings.timestamp = millis();
+    } else {
+        automationSync.clearSensorOverride();
+    }
+
+    resp["ok"] = true;
+    resp["mockEnabled"] = automationSync.isSensorOverrideEnabled();
+    resp["temperature"] = _cachedReadings.temperature;
+    resp["humidity"] = _cachedReadings.humidity;
+    resp["co2"] = _cachedReadings.co2;
+    resp["vpd"] = _cachedReadings.vpd;
+
+    String output;
+    serializeJson(resp, output);
+    _server->send(200, getJsonContentType(), output);
+}
+
 void WebMonitor::handleApiRelays() {
     JsonDocument doc;
     
@@ -181,7 +232,7 @@ void WebMonitor::handleApiRelays() {
         
         JsonArray relays = doc["relays"].to<JsonArray>();
         
-        const char* names[] = {"Light", "FanCirc", "FanExh", "Pump1", "Pump2", "Pump3", "CO2", "AC"};
+        const char* names[] = {"Light", "PhunAm", "HutAm", "CO2", "Pump", "QuatThoi", "QuatHut", "Option"};
         bool stateArr[] = {states.relay1, states.relay2, states.relay3, states.relay4, 
                            states.relay5, states.relay6, states.relay7, states.relay8};
         
@@ -293,70 +344,183 @@ void WebMonitor::handleApiAutomation() {
 void WebMonitor::handleApiAutomationFull() {
     JsonDocument doc;
     
+    // Basic info
     doc["loaded"] = automationSync.isLoaded();
     doc["version"] = automationSync.getVersion();
     doc["gatewayId"] = automationSync.getGatewayId();
     doc["roomId"] = automationSync.getRoomId();
     doc["ruleCount"] = automationSync.getRuleCount();
+    
+    // Phase & Week info (JSON v3)
     doc["currentWeek"] = automationSync.getCurrentWeek();
     doc["currentPhase"] = automationSync.getCurrentPhase();
+    doc["currentWeekInPhase"] = automationSync.getCurrentWeekInPhase();
+    doc["phaseWeekCount"] = automationSync.getPhaseWeekCount();
     doc["totalWeeks"] = automationSync.getTotalWeeks();
-    doc["plantStartTimestamp"] = automationSync.getPlantStartTimestamp();
+    doc["projectDay"] = automationSync.getProjectDay();
+    doc["currentDayInWeek"] = automationSync.getCurrentDayInWeek();
+    doc["lifecycleOverride"] = automationSync.isLifecycleOverrideEnabled();
+    
+    // Timezone
     doc["timezoneOffset"] = automationSync.getTimezoneOffset();
     doc["timezoneName"] = automationSync.getTimezoneName();
+    doc["plantStartTimestamp"] = automationSync.getPlantStartTimestamp();
     
-    // Get all weekly plans
-    JsonArray weeksArray = doc["weeklyPlans"].to<JsonArray>();
-    const WeeklyPlan* plans = automationSync.getWeeklyPlans();
-    int planCount = automationSync.getWeeklyPlanCount();
-    
-    Serial.printf("[WebMonitor] ðŸ“… API /automation/full - Weekly Plans Count: %d\n", planCount);
-    
-    for (int i = 0; i < planCount; i++) {
-        JsonObject weekObj = weeksArray.add<JsonObject>();
-        weekObj["week"] = plans[i].week;
-        weekObj["phase"] = plans[i].phase;
-        
-        Serial.printf("[WebMonitor] ðŸ“… Week %d: %s\n", plans[i].week, plans[i].phase);
-        
-        // Lighting
-        JsonObject lighting = weekObj["lighting"].to<JsonObject>();
-        lighting["lightsOn"] = plans[i].lighting.lightsOn;
-        lighting["lightsOff"] = plans[i].lighting.lightsOff;
-        
-        // Targets
-        JsonObject targets = weekObj["targets"].to<JsonObject>();
-        targets["tempTargetDay"] = plans[i].targets.tempTargetDay;
-        targets["humiHighDay"] = plans[i].targets.humiHighDay;
-        targets["humiLowDay"] = plans[i].targets.humiLowDay;
-        targets["co2StartDay"] = plans[i].targets.co2StartDay;
-        targets["co2StopDay"] = plans[i].targets.co2StopDay;
-        targets["tempTargetNight"] = plans[i].targets.tempTargetNight;
-        targets["humiHighNight"] = plans[i].targets.humiHighNight;
-        targets["humiLowNight"] = plans[i].targets.humiLowNight;
-        targets["co2StartNight"] = plans[i].targets.co2StartNight;
-        targets["co2StopNight"] = plans[i].targets.co2StopNight;
-        targets["vpdMin"] = plans[i].targets.vpdMin;
-        targets["vpdMax"] = plans[i].targets.vpdMax;
-        
-        // Equipment
-        JsonObject equipment = weekObj["equipment"].to<JsonObject>();
-        equipment["fanCircMode"] = plans[i].equipment.fanCircMode;
-        equipment["fanCircOnTime"] = plans[i].equipment.fanCircOnTime;
-        equipment["fanCircOffTime"] = plans[i].equipment.fanCircOffTime;
-        equipment["fanCircTriggerTemp"] = plans[i].equipment.fanCircTriggerTemp;
-        equipment["fanExhMode"] = plans[i].equipment.fanExhMode;
-        equipment["fanExhOnTime"] = plans[i].equipment.fanExhOnTime;
-        equipment["fanExhOffTime"] = plans[i].equipment.fanExhOffTime;
-        equipment["fanExhTriggerHumi"] = plans[i].equipment.fanExhTriggerHumi;
-        equipment["fanExhTriggerVpd"] = plans[i].equipment.fanExhTriggerVpd;
-        equipment["acMode"] = plans[i].equipment.acMode;
-        equipment["acTargetTemp"] = plans[i].equipment.acTargetTemp;
-        equipment["acFanSpeed"] = plans[i].equipment.acFanSpeed;
+    // Current week targets (for quick access)
+    const EnvironmentTargets* targets = automationSync.getCurrentTargets();
+    if (targets) {
+      JsonObject tgt = doc["targets"].to<JsonObject>();
+      tgt["tempTargetDay"] = targets->tempTargetDay;
+      tgt["tempTargetNight"] = targets->tempTargetNight;
+      tgt["humiHighDay"] = targets->humiHighDay;
+      tgt["humiLowDay"] = targets->humiLowDay;
+      tgt["humiHighNight"] = targets->humiHighNight;
+      tgt["humiLowNight"] = targets->humiLowNight;
+      tgt["co2StartDay"] = targets->co2StartDay;
+      tgt["co2StopDay"] = targets->co2StopDay;
+      tgt["co2StartNight"] = targets->co2StartNight;
+      tgt["co2StopNight"] = targets->co2StopNight;
+      tgt["vpdMin"] = targets->vpdMin;
+      tgt["vpdMax"] = targets->vpdMax;
+      tgt["humidityMode"] = targets->humidityMode;
     }
+    
+    // Current week lighting (with PWM schedule)
+    const LightingSchedule* lighting = automationSync.getCurrentLightingSchedule();
+    if (lighting) {
+      JsonObject light = doc["lighting"].to<JsonObject>();
+      light["lightsOn"] = lighting->lightsOn;
+      light["lightsOff"] = lighting->lightsOff;
+      
+      // PWM dimming points
+      JsonArray schedule = light["schedule"].to<JsonArray>();
+      for (int i = 0; i < lighting->scheduleCount && i < 10; i++) {
+        JsonObject point = schedule.add<JsonObject>();
+        point["time"] = lighting->schedule[i].time;
+        point["brightness"] = lighting->schedule[i].brightness;
+        
+        JsonObject channels = point["channels"].to<JsonObject>();
+        channels["ch1"] = lighting->schedule[i].ch1;  // White
+        channels["ch2"] = lighting->schedule[i].ch2;  // Yellow
+        channels["ch3"] = lighting->schedule[i].ch3;  // Red
+      }
+    }
+    
+    // Current week equipment config
+    const EquipmentConfig* equipment = automationSync.getCurrentEquipmentConfig();
+    if (equipment) {
+      JsonObject equip = doc["equipment"].to<JsonObject>();
+      
+      JsonObject fanCirc = equip["fanCirculation"].to<JsonObject>();
+      fanCirc["mode"] = equipment->fanCircMode;
+      fanCirc["triggerTemp"] = equipment->fanCircTriggerTemp;
+      
+      JsonObject fanExh = equip["fanExhaust"].to<JsonObject>();
+      fanExh["mode"] = equipment->fanExhMode;
+      fanExh["triggerHumidity"] = equipment->fanExhTriggerHumi;
+      fanExh["triggerVpd"] = equipment->fanExhTriggerVpd;
+      
+      JsonObject ac = equip["ac"].to<JsonObject>();
+      ac["mode"] = equipment->acMode;
+      ac["targetTemp"] = equipment->acTargetTemp;
+      ac["fanSpeed"] = equipment->acFanSpeed;
+    }
+    
+    // Irrigation schedules (for current week)
+    JsonArray irrigArray = doc["irrigation"].to<JsonArray>();
+    const IrrigationConfig* irrigs = automationSync.getIrrigations();
+    int irrigCount = automationSync.getIrrigationCount();
+    
+    for (int i = 0; i < irrigCount; i++) {
+      JsonObject irrigObj = irrigArray.add<JsonObject>();
+      irrigObj["startTime"] = irrigs[i].cycleStart;
+      irrigObj["endTime"] = irrigs[i].cycleEnd;
+      irrigObj["durationMinutes"] = irrigs[i].pumpDurationSec / 60;
+      irrigObj["flowRate"] = 2.5;  // Default 2.5 L/min
+      irrigObj["enabled"] = irrigs[i].enabled;
+    }
+    
+    // Relay states (current status)
+    if (_relays) {
+      JsonArray relayStates = doc["relayStates"].to<JsonArray>();
+      for (int i = 0; i < 8; i++) {
+        relayStates.add(_relays->getRelay(i));
+      }
+    }
+    
+    // Sensor readings (current readings)
+    if (_sensors) {
+      JsonObject readings = doc["sensorReadings"].to<JsonObject>();
+      readings["temperature"] = _cachedReadings.temperature;
+      readings["humidity"] = _cachedReadings.humidity;
+      readings["co2"] = _cachedReadings.co2;
+      readings["vpd"] = _cachedReadings.vpd;
+    }
+
+        doc["sensorMockEnabled"] = automationSync.isSensorOverrideEnabled();
+    
+    // Automation status
+    doc["irrigationCount"] = automationSync.getIrrigationCount();
+    doc["automationRunning"] = true;
     
     String output;
     serializeJson(doc, output);
+    _server->send(200, getJsonContentType(), output);
+}
+
+void WebMonitor::handleApiLifecycleSet() {
+    JsonDocument doc;
+    JsonDocument resp;
+
+    String body = _server->arg("plain");
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        resp["ok"] = false;
+        resp["message"] = "Invalid JSON";
+        String output;
+        serializeJson(resp, output);
+        _server->send(400, getJsonContentType(), output);
+        return;
+    }
+
+    int projectDay = doc["projectDay"] | 0;
+    int currentWeek = 0;
+    const char* phase = doc["currentPhase"] | "";
+
+    if (projectDay < 1) {
+        resp["ok"] = false;
+        resp["message"] = "projectDay must be >= 1";
+        String output;
+        serializeJson(resp, output);
+        _server->send(400, getJsonContentType(), output);
+        return;
+    }
+
+    bool ok = automationSync.setLifecycleOverride(projectDay, currentWeek, phase);
+    resp["ok"] = ok;
+    resp["message"] = ok ? "Saved" : "Failed to save";
+    resp["projectDay"] = automationSync.getProjectDay();
+    resp["currentWeek"] = automationSync.getCurrentWeek();
+    resp["currentWeekInPhase"] = automationSync.getCurrentWeekInPhase();
+    resp["currentPhase"] = automationSync.getCurrentPhase();
+
+    if (ok && mqttHandler.isConnected()) {
+        mqttHandler.publishLifecycleStatus(
+            true,
+            WiFi.localIP().toString().c_str(),
+            WiFi.RSSI(),
+            millis() / 1000,
+            ESP.getFreeHeap(),
+            automationSync.getProjectDay(),
+            automationSync.getCurrentDayInWeek(),
+            automationSync.getCurrentWeek(),
+            automationSync.getCurrentWeekInPhase(),
+            automationSync.getCurrentPhase()
+        );
+    }
+
+    String output;
+    serializeJson(resp, output);
     _server->send(200, getJsonContentType(), output);
 }
 
@@ -568,10 +732,10 @@ void WebMonitor::handleApiAutomationCheck() {
 // ============================================================================
 
 void WebMonitor::handleRoot() {
-    _server->send_P(200, "text/html", DASHBOARD_PAGE);
+    _server->send_P(200, "text/html", DASHBOARD_HTML);
 }
 
 String WebMonitor::getMonitorPage() {
-    return String(FPSTR(DASHBOARD_PAGE));
+    return String(FPSTR(DASHBOARD_HTML));
 }
 

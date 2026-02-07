@@ -8,9 +8,25 @@
 #include "automation_sync.h"
 #include <MD5Builder.h>
 #include <time.h>
+#include <Preferences.h>
 
 // Global instance
 AutomationSync automationSync;
+
+// Lifecycle override storage
+static const char* LIFECYCLE_NS = "lifecycle";
+static const char* KEY_LIFECYCLE_ENABLED = "enabled";
+static const char* KEY_LIFECYCLE_BASE_TS = "baseTs";
+static const char* KEY_LIFECYCLE_BASE_DAY = "baseDay";
+static const char* KEY_LIFECYCLE_BASE_WEEK = "baseWeek";
+static const char* KEY_LIFECYCLE_BASE_DOW = "baseDow";
+static const char* KEY_LIFECYCLE_PHASE = "phase";
+
+static const char* LICENSE_NS = "license";
+static const char* KEY_LICENSE_ACTIVE = "active";
+static const char* KEY_LICENSE_EXPIRES = "expires";
+static const char* KEY_LICENSE_LAST_SYNC = "lastSync";
+static const char* KEY_LICENSE_GRACE = "grace";
 
 // ============================================
 // CONSTRUCTOR
@@ -22,6 +38,7 @@ AutomationSync::AutomationSync() {
   _ruleCount = 0;
   _irrigationCount = 0;
   _weeklyPlanCount = 0;
+  _phaseCount = 0;
   _relayCallback = nullptr;
   
   // Timezone (default Vietnam UTC+7)
@@ -33,9 +50,29 @@ AutomationSync::AutomationSync() {
   _plantStartTimestamp = 0;
   _totalWeeks = 0;
   _currentWeek = 1;
+  _currentWeekInPhase = 1;  // Week within current phase
   _currentDay = 1;
+  _currentProjectDay = 1;
   memset(_currentPhase, 0, sizeof(_currentPhase));
-  strcpy(_currentPhase, "Seedling");
+  strcpy(_currentPhase, "SEEDING");
+
+  _lifecycleOverrideEnabled = false;
+  _lifecycleBaseTimestamp = 0;
+  _lifecycleBaseProjectDay = 1;
+  _lifecycleBaseWeek = 1;
+  _lifecycleBaseDayInWeek = 1;
+  memset(_lifecyclePhaseOverride, 0, sizeof(_lifecyclePhaseOverride));
+
+  _licenseActive = false;
+  _licenseExpiresAt = 0;
+  _lastCloudSync = 0;
+  _offlineGraceDays = 180;
+
+  _sensorOverrideEnabled = false;
+  _sensorOverrideTemp = 0.0f;
+  _sensorOverrideHumi = 0.0f;
+  _sensorOverrideCo2 = 0.0f;
+  _sensorOverrideVpd = 0.0f;
   
   memset(_gatewayId, 0, sizeof(_gatewayId));
   memset(_roomId, 0, sizeof(_roomId));
@@ -105,6 +142,9 @@ bool AutomationSync::begin() {
       _loaded = true;
     }
   }
+
+  loadLifecycleOverride();
+  loadLicenseState();
   
   return true;
 }
@@ -166,10 +206,35 @@ SyncAckPayload AutomationSync::getAckPayload(bool success, const char* errorCode
 // ============================================
 
 void AutomationSync::updateSensorValues(float temp, float humi, float co2, float vpd) {
+  if (_sensorOverrideEnabled) {
+    _currentTemp = _sensorOverrideTemp;
+    _currentHumi = _sensorOverrideHumi;
+    _currentCo2 = _sensorOverrideCo2;
+    _currentVpd = _sensorOverrideVpd;
+    return;
+  }
+
   _currentTemp = temp;
   _currentHumi = humi;
   _currentCo2 = co2;
   _currentVpd = vpd;
+}
+
+void AutomationSync::setSensorOverride(float temp, float humi, float co2, float vpd) {
+  _sensorOverrideEnabled = true;
+  _sensorOverrideTemp = temp;
+  _sensorOverrideHumi = humi;
+  _sensorOverrideCo2 = co2;
+  _sensorOverrideVpd = vpd;
+
+  _currentTemp = temp;
+  _currentHumi = humi;
+  _currentCo2 = co2;
+  _currentVpd = vpd;
+}
+
+void AutomationSync::clearSensorOverride() {
+  _sensorOverrideEnabled = false;
 }
 
 // ============================================
@@ -177,7 +242,7 @@ void AutomationSync::updateSensorValues(float temp, float humi, float co2, float
 // ============================================
 
 void AutomationSync::runRules() {
-  if (!_loaded) return;
+  if (!_loaded || !isAutomationAllowed()) return;
   
   // Process any pending deferred actions first (non-blocking)
   processDeferredActions();
@@ -240,7 +305,7 @@ void AutomationSync::runRules() {
 }
 
 void AutomationSync::checkLightingSchedule() {
-  if (!_loaded) return;
+  if (!_loaded || !isAutomationAllowed()) return;
   
   static bool lastLightState = false;
   bool shouldBeOn = isDaytime();
@@ -252,7 +317,7 @@ void AutomationSync::checkLightingSchedule() {
 }
 
 void AutomationSync::checkEquipmentSchedules() {
-  if (!_loaded) return;
+  if (!_loaded || !isAutomationAllowed()) return;
   
   // Fan circulation
   if (strcmp(_equipment.fanCircMode, "24H") == 0) {
@@ -281,7 +346,7 @@ void AutomationSync::checkEquipmentSchedules() {
 }
 
 void AutomationSync::checkIrrigationSchedules() {
-  if (!_loaded) return;
+  if (!_loaded || !isAutomationAllowed()) return;
   
   char now[6];
   getCurrentTime(now);
@@ -677,6 +742,22 @@ String AutomationSync::calculateMD5(const char* data) {
 // PAYLOAD PARSING
 // ============================================
 
+static unsigned long parseIsoTimestamp(const char* iso) {
+  if (!iso || strlen(iso) < 10) return 0;
+  struct tm tm;
+  memset(&tm, 0, sizeof(tm));
+  if (sscanf(iso, "%d-%d-%dT%d:%d:%d",
+             &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+             &tm.tm_hour, &tm.tm_min, &tm.tm_sec) < 3) {
+    return 0;
+  }
+  tm.tm_year -= 1900;
+  tm.tm_mon -= 1;
+  time_t ts = mktime(&tm);
+  if (ts < 0) return 0;
+  return (unsigned long)ts;
+}
+
 bool AutomationSync::parsePayload(const char* jsonData) {
   // Allocate JSON document (ArduinoJson 7.x auto-sizes)
   JsonDocument doc;
@@ -732,6 +813,30 @@ bool AutomationSync::parsePayload(const char* jsonData) {
   configTime(_timezoneOffset, 0, "pool.ntp.org", "time.nist.gov");
   Serial.printf("[AutoSync] 🕐 Timezone: %s (UTC%+ld)\n", 
                 _timezoneName, _timezoneOffset / 3600);
+
+  // Parse license info (from Cloud)
+  JsonObject licenseObj = doc["license"];
+  if (!licenseObj.isNull()) {
+    bool wasActive = _licenseActive;
+    _licenseActive = licenseObj["active"] | true;
+    const char* expiresAt = licenseObj["expiresAt"] | "";
+    unsigned long expiresTs = parseIsoTimestamp(expiresAt);
+    if (expiresTs > 0) {
+      _licenseExpiresAt = expiresTs;
+    }
+    _offlineGraceDays = licenseObj["offlineGraceDays"] | _offlineGraceDays;
+    if (_offlineGraceDays < 0) _offlineGraceDays = 0;
+
+    time_t now = time(nullptr);
+    if (now >= 1577836800) {
+      _lastCloudSync = (unsigned long)now;
+    }
+    saveLicenseState();
+
+    if (!wasActive && _licenseActive) {
+      resetLifecycleForNewLicense();
+    }
+  }
   
   // Parse lighting schedule
   strlcpy(_lighting.lightsOn, doc["lighting"]["lightsOn"] | "06:00", sizeof(_lighting.lightsOn));
@@ -875,66 +980,22 @@ bool AutomationSync::parsePayload(const char* jsonData) {
     }
   }
   
-  _totalWeeks = doc["totalWeeks"] | 12;
+  _totalWeeks = doc["totalWeeks"] | 16;
+  _currentWeek = doc["currentWeek"] | 1;
   
-  // Parse weekly plans array
-  JsonArray weeklyPlansArray = doc["weeklyPlans"];
-  _weeklyPlanCount = 0;
-  
-  for (JsonObject planObj : weeklyPlansArray) {
-    if (_weeklyPlanCount >= MAX_WEEKLY_PLANS) break;
-    
-    WeeklyPlan& plan = _weeklyPlans[_weeklyPlanCount];
-    plan.week = planObj["week"] | 1;
-    strlcpy(plan.phase, planObj["phase"] | "Unknown", sizeof(plan.phase));
-    
-    // Parse targets for this week
-    JsonObject targetsObj = planObj["targets"];
-    plan.targets.tempTargetDay = targetsObj["tempTargetDay"] | 26.0;
-    plan.targets.humiHighDay = targetsObj["humiHighDay"] | 70;
-    plan.targets.humiLowDay = targetsObj["humiLowDay"] | 60;
-    plan.targets.co2StartDay = targetsObj["co2StartDay"] | 1000;
-    plan.targets.co2StopDay = targetsObj["co2StopDay"] | 1400;
-    plan.targets.tempTargetNight = targetsObj["tempTargetNight"] | 20.0;
-    plan.targets.humiHighNight = targetsObj["humiHighNight"] | 65;
-    plan.targets.humiLowNight = targetsObj["humiLowNight"] | 55;
-    plan.targets.co2StartNight = targetsObj["co2StartNight"] | 450;
-    plan.targets.co2StopNight = targetsObj["co2StopNight"] | 600;
-    plan.targets.vpdMin = targetsObj["vpdMin"] | 0.8;
-    plan.targets.vpdMax = targetsObj["vpdMax"] | 1.2;
-    
-    // Parse lighting for this week
-    strlcpy(plan.lighting.lightsOn, planObj["lighting"]["lightsOn"] | "06:00", sizeof(plan.lighting.lightsOn));
-    strlcpy(plan.lighting.lightsOff, planObj["lighting"]["lightsOff"] | "18:00", sizeof(plan.lighting.lightsOff));
-    
-    // Parse equipment for this week
-    JsonObject equipObj = planObj["equipment"];
-    strlcpy(plan.equipment.fanCircMode, equipObj["fanCirculation"]["mode"] | "24H", sizeof(plan.equipment.fanCircMode));
-    strlcpy(plan.equipment.fanCircOnTime, equipObj["fanCirculation"]["onTime"] | "", sizeof(plan.equipment.fanCircOnTime));
-    strlcpy(plan.equipment.fanCircOffTime, equipObj["fanCirculation"]["offTime"] | "", sizeof(plan.equipment.fanCircOffTime));
-    plan.equipment.fanCircTriggerTemp = equipObj["fanCirculation"]["triggerTemp"] | 28.0;
-    
-    strlcpy(plan.equipment.fanExhMode, equipObj["fanExhaust"]["mode"] | "24H", sizeof(plan.equipment.fanExhMode));
-    strlcpy(plan.equipment.fanExhOnTime, equipObj["fanExhaust"]["onTime"] | "", sizeof(plan.equipment.fanExhOnTime));
-    strlcpy(plan.equipment.fanExhOffTime, equipObj["fanExhaust"]["offTime"] | "", sizeof(plan.equipment.fanExhOffTime));
-    plan.equipment.fanExhTriggerHumi = equipObj["fanExhaust"]["triggerHumidity"] | 75.0;
-    plan.equipment.fanExhTriggerVpd = equipObj["fanExhaust"]["triggerVpd"] | 1.5;
-    
-    strlcpy(plan.equipment.acMode, equipObj["ac"]["mode"] | "OFF", sizeof(plan.equipment.acMode));
-    plan.equipment.acTargetTemp = equipObj["ac"]["targetTemp"] | 26.0;
-    strlcpy(plan.equipment.acFanSpeed, equipObj["ac"]["fanSpeed"] | "AUTO", sizeof(plan.equipment.acFanSpeed));
-    
-    _weeklyPlanCount++;
+  // Parse nested weekly plans structure (SEEDING/VEG/FLOWER/HARVEST -> weeks)
+  if (doc.containsKey("weeklyPlans")) {
+    if (!parseNestedWeeklyPlans(doc["weeklyPlans"])) {
+      Serial.println("[AutoSync] ❌ Failed to parse nested weeklyPlans");
+      return false;
+    }
   }
   
-  Serial.printf("[AutoSync] ✅ Parsed v%d: %d rules, %d irrigation, %d weekly plans\n", 
-                _version, _ruleCount, _irrigationCount, _weeklyPlanCount);
+  // Calculate current phase and week info based on currentWeek
+  updateCurrentWeekInfo();
   
-  // Calculate current week and select appropriate plan
-  if (_plantStartTimestamp > 0) {
-    calculateCurrentWeek();
-    selectWeeklyPlan(_currentWeek);
-  }
+  Serial.printf("[AutoSync] ✅ Parsed v%d: %d rules, %d irrigation, current week: %d, phase: %s\n", 
+                _version, _ruleCount, _irrigationCount, _currentWeek, _currentPhase);
   
   return true;
 }
@@ -944,9 +1005,14 @@ bool AutomationSync::parsePayload(const char* jsonData) {
 // ============================================
 
 void AutomationSync::calculateCurrentWeek() {
+  if (_lifecycleOverrideEnabled) {
+    applyLifecycleOverride();
+    return;
+  }
   if (_plantStartTimestamp == 0) {
     _currentWeek = 1;
     _currentDay = 1;
+    _currentProjectDay = 1;
     return;
   }
   
@@ -958,6 +1024,7 @@ void AutomationSync::calculateCurrentWeek() {
     Serial.println("[AutoSync] ⚠️ Time not synced, using week 1");
     _currentWeek = 1;
     _currentDay = 1;
+    _currentProjectDay = 1;
     return;
   }
   
@@ -969,6 +1036,7 @@ void AutomationSync::calculateCurrentWeek() {
     // Plant hasn't started yet
     _currentWeek = 1;
     _currentDay = 1;
+    _currentProjectDay = 1;
     Serial.println("[AutoSync] 📅 Plant hasn't started yet");
     return;
   }
@@ -976,6 +1044,7 @@ void AutomationSync::calculateCurrentWeek() {
   // Calculate week (1-based) and day within week (1-7)
   _currentWeek = (daysSinceStart / 7) + 1;
   _currentDay = (daysSinceStart % 7) + 1;
+  _currentProjectDay = daysSinceStart + 1;
   
   // Cap at total weeks
   if (_currentWeek > _totalWeeks && _totalWeeks > 0) {
@@ -984,6 +1053,171 @@ void AutomationSync::calculateCurrentWeek() {
   
   Serial.printf("[AutoSync] 📅 Current: Week %d, Day %d (days since start: %d)\n", 
                 _currentWeek, _currentDay, daysSinceStart);
+}
+
+bool AutomationSync::isAutomationAllowed() const {
+  if (!_licenseActive) return false;
+
+  time_t now = time(nullptr);
+  if (now >= 1577836800) {
+    if (_licenseExpiresAt > 0 && now > (time_t)_licenseExpiresAt) {
+      return false;
+    }
+
+    if (_lastCloudSync > 0 && _offlineGraceDays > 0) {
+      long daysOffline = (now - (time_t)_lastCloudSync) / 86400;
+      if (daysOffline > _offlineGraceDays) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+void AutomationSync::loadLicenseState() {
+  Preferences prefs;
+  prefs.begin(LICENSE_NS, true);
+  _licenseActive = prefs.getBool(KEY_LICENSE_ACTIVE, _licenseActive);
+  _licenseExpiresAt = prefs.getULong(KEY_LICENSE_EXPIRES, _licenseExpiresAt);
+  _lastCloudSync = prefs.getULong(KEY_LICENSE_LAST_SYNC, _lastCloudSync);
+  _offlineGraceDays = prefs.getInt(KEY_LICENSE_GRACE, _offlineGraceDays);
+  prefs.end();
+}
+
+void AutomationSync::saveLicenseState() {
+  Preferences prefs;
+  prefs.begin(LICENSE_NS, false);
+  prefs.putBool(KEY_LICENSE_ACTIVE, _licenseActive);
+  prefs.putULong(KEY_LICENSE_EXPIRES, _licenseExpiresAt);
+  prefs.putULong(KEY_LICENSE_LAST_SYNC, _lastCloudSync);
+  prefs.putInt(KEY_LICENSE_GRACE, _offlineGraceDays);
+  prefs.end();
+}
+
+bool AutomationSync::setLifecycleOverride(int projectDay, int currentWeek, const char* phaseName) {
+  if (projectDay < 1) return false;
+
+  int dayInWeek = ((projectDay - 1) % 7) + 1;
+  int weekFromDay = ((projectDay - 1) / 7) + 1;
+
+  if (currentWeek <= 0) {
+    currentWeek = weekFromDay;
+  }
+
+  if (phaseName && strlen(phaseName) > 0 && _phaseCount > 0) {
+    for (int i = 0; i < _phaseCount; i++) {
+      if (strcmp(_phaseWeeks[i].phaseName, phaseName) == 0) {
+        if (currentWeek < _phaseWeeks[i].startGlobalWeek) {
+          currentWeek = _phaseWeeks[i].startGlobalWeek;
+        } else if (currentWeek > _phaseWeeks[i].endGlobalWeek) {
+          currentWeek = _phaseWeeks[i].endGlobalWeek;
+        }
+        break;
+      }
+    }
+  }
+
+  projectDay = (currentWeek - 1) * 7 + dayInWeek;
+
+  time_t now = time(nullptr);
+  if (now < 1577836800) {
+    now = 0;
+  }
+
+  _lifecycleOverrideEnabled = true;
+  _lifecycleBaseTimestamp = (unsigned long)now;
+  _lifecycleBaseProjectDay = projectDay;
+  _lifecycleBaseWeek = currentWeek;
+  _lifecycleBaseDayInWeek = dayInWeek;
+  memset(_lifecyclePhaseOverride, 0, sizeof(_lifecyclePhaseOverride));
+  if (phaseName && strlen(phaseName) > 0) {
+    strlcpy(_lifecyclePhaseOverride, phaseName, sizeof(_lifecyclePhaseOverride));
+  }
+
+  saveLifecycleOverride();
+  calculateCurrentWeek();
+  selectWeeklyPlan(_currentWeek);
+  return true;
+}
+
+bool AutomationSync::clearLifecycleOverride() {
+  _lifecycleOverrideEnabled = false;
+  _lifecycleBaseTimestamp = 0;
+  _lifecycleBaseProjectDay = 1;
+  _lifecycleBaseWeek = 1;
+  _lifecycleBaseDayInWeek = 1;
+  memset(_lifecyclePhaseOverride, 0, sizeof(_lifecyclePhaseOverride));
+
+  saveLifecycleOverride();
+  calculateCurrentWeek();
+  selectWeeklyPlan(_currentWeek);
+  return true;
+}
+
+void AutomationSync::loadLifecycleOverride() {
+  Preferences prefs;
+  prefs.begin(LIFECYCLE_NS, true);
+  _lifecycleOverrideEnabled = prefs.getBool(KEY_LIFECYCLE_ENABLED, false);
+  _lifecycleBaseTimestamp = prefs.getULong(KEY_LIFECYCLE_BASE_TS, 0);
+  _lifecycleBaseProjectDay = prefs.getInt(KEY_LIFECYCLE_BASE_DAY, 1);
+  _lifecycleBaseWeek = prefs.getInt(KEY_LIFECYCLE_BASE_WEEK, 1);
+  _lifecycleBaseDayInWeek = prefs.getInt(KEY_LIFECYCLE_BASE_DOW, 1);
+  String phase = prefs.getString(KEY_LIFECYCLE_PHASE, "");
+  prefs.end();
+
+  memset(_lifecyclePhaseOverride, 0, sizeof(_lifecyclePhaseOverride));
+  if (phase.length() > 0) {
+    strlcpy(_lifecyclePhaseOverride, phase.c_str(), sizeof(_lifecyclePhaseOverride));
+  }
+}
+
+void AutomationSync::saveLifecycleOverride() {
+  Preferences prefs;
+  prefs.begin(LIFECYCLE_NS, false);
+  prefs.putBool(KEY_LIFECYCLE_ENABLED, _lifecycleOverrideEnabled);
+  prefs.putULong(KEY_LIFECYCLE_BASE_TS, _lifecycleBaseTimestamp);
+  prefs.putInt(KEY_LIFECYCLE_BASE_DAY, _lifecycleBaseProjectDay);
+  prefs.putInt(KEY_LIFECYCLE_BASE_WEEK, _lifecycleBaseWeek);
+  prefs.putInt(KEY_LIFECYCLE_BASE_DOW, _lifecycleBaseDayInWeek);
+  prefs.putString(KEY_LIFECYCLE_PHASE, _lifecyclePhaseOverride);
+  prefs.end();
+}
+
+void AutomationSync::applyLifecycleOverride() {
+  time_t now = time(nullptr);
+  int deltaDays = 0;
+  if (_lifecycleBaseTimestamp > 0 && now >= 1577836800) {
+    deltaDays = (int)((now - _lifecycleBaseTimestamp) / 86400);
+  }
+
+  int baseOffset = _lifecycleBaseDayInWeek - 1 + deltaDays;
+  _currentDay = (baseOffset % 7) + 1;
+  _currentWeek = _lifecycleBaseWeek + (baseOffset / 7);
+  _currentProjectDay = _lifecycleBaseProjectDay + deltaDays;
+
+  updateCurrentWeekInfo();
+
+  if (strlen(_lifecyclePhaseOverride) > 0) {
+    for (int i = 0; i < _phaseCount; i++) {
+      if (strcmp(_phaseWeeks[i].phaseName, _lifecyclePhaseOverride) == 0) {
+        strlcpy(_currentPhase, _lifecyclePhaseOverride, sizeof(_currentPhase));
+        int weekInPhase = _currentWeek - _phaseWeeks[i].startGlobalWeek + 1;
+        if (weekInPhase < 1) weekInPhase = 1;
+        if (weekInPhase > _phaseWeeks[i].weekCount) weekInPhase = _phaseWeeks[i].weekCount;
+        _currentWeekInPhase = weekInPhase;
+        return;
+      }
+    }
+
+    strlcpy(_currentPhase, _lifecyclePhaseOverride, sizeof(_currentPhase));
+    _currentWeekInPhase = 1;
+  }
+}
+
+void AutomationSync::resetLifecycleForNewLicense() {
+  setLifecycleOverride(1, 1, "SEEDING");
+  Serial.println("[AutoSync] 🔁 License re-activated: lifecycle reset to Day 1 / SEEDING");
 }
 
 void AutomationSync::selectWeeklyPlan(int week) {
@@ -1027,4 +1261,280 @@ void AutomationSync::selectWeeklyPlan(int week) {
   } else {
     Serial.println("[AutoSync] ⚠️ No weekly plan found, using defaults");
   }
+}
+// ============================================
+// PARSE NESTED WEEKLY PLANS (JSON v3)
+// ============================================
+
+bool AutomationSync::parseNestedWeeklyPlans(JsonObject weeklyPlansObj) {
+  Serial.println("\n[AutoSync] 📋 Parsing nested weeklyPlans (JSON v3)...");
+  
+  _phaseCount = 0;
+  _weeklyPlanCount = 0;
+  int globalWeek = 1;  // Running counter for global week
+  
+  // Phase order (as they appear in lifecycle)
+  const char* phases[] = {"SEEDING", "VEG", "FLOWER", "HARVEST"};
+  
+  // ========================================
+  // Parse each phase
+  // ========================================
+  
+  for (int p = 0; p < 4; p++) {
+    const char* phaseName = phases[p];
+    
+    // Skip if phase not in JSON
+    if (!weeklyPlansObj.containsKey(phaseName)) {
+      Serial.printf("[AutoSync] ⏭️  Phase '%s' not found\n", phaseName);
+      continue;
+    }
+    
+    JsonObject phaseObj = weeklyPlansObj[phaseName];
+    PhaseWeeks& phase = _phaseWeeks[_phaseCount];
+    
+    // Initialize phase structure
+    strlcpy(phase.phaseName, phaseName, sizeof(phase.phaseName));
+    phase.weekCount = 0;
+    phase.startGlobalWeek = globalWeek;
+    
+    Serial.printf("[AutoSync] 📦 Phase: %s\n", phaseName);
+    
+    // ========================================
+    // Parse each week in this phase
+    // ========================================
+    
+    for (JsonPair weekPair : phaseObj) {
+      if (phase.weekCount >= 10) {
+        Serial.printf("[AutoSync] ⚠️  Phase %s has >10 weeks, skipping rest\n", phaseName);
+        break;
+      }
+      
+      const char* weekKey = weekPair.key().c_str();  // "1", "2", "3"...
+      int weekInPhase = atoi(weekKey);
+      JsonObject weekObj = weekPair.value();
+      
+      WeeklyPlan& plan = phase.weeks[phase.weekCount];
+      
+      // Set week identifiers
+      plan.week = weekInPhase;           // Within phase: 1-8
+      plan.globalWeek = globalWeek;      // Global: 1-16
+      strlcpy(plan.phase, phaseName, sizeof(plan.phase));
+      
+      Serial.printf("[AutoSync]   📅 Week %d/%d (Phase: %s, Global: %d)\n",
+                    weekInPhase, 
+                    weekKey[1] ? 100 : weekInPhase,  // Crude multi-week detect
+                    phaseName, globalWeek);
+      
+      // ========================================
+      // Parse TARGETS for this week
+      // ========================================
+      
+      JsonObject targetsObj = weekObj["targets"];
+      EnvironmentTargets& targets = plan.targets;
+      
+      targets.tempTargetDay = targetsObj["tempTargetDay"] | 26.0;
+      targets.humiHighDay = targetsObj["humiHighDay"] | 70;
+      targets.humiLowDay = targetsObj["humiLowDay"] | 60;
+      targets.co2StartDay = targetsObj["co2StartDay"] | 1000;
+      targets.co2StopDay = targetsObj["co2StopDay"] | 1400;
+      targets.tempTargetNight = targetsObj["tempTargetNight"] | 20.0;
+      targets.humiHighNight = targetsObj["humiHighNight"] | 65;
+      targets.humiLowNight = targetsObj["humiLowNight"] | 55;
+      targets.co2StartNight = targetsObj["co2StartNight"] | 450;
+      targets.co2StopNight = targetsObj["co2StopNight"] | 600;
+      targets.vpdMin = targetsObj["vpdMin"] | 0.8;
+      targets.vpdMax = targetsObj["vpdMax"] | 1.2;
+      strlcpy(targets.humidityMode, 
+              targetsObj["humidityMode"] | "DEHUMIDIFY", 
+              sizeof(targets.humidityMode));
+      
+      Serial.printf("[AutoSync]     🌡️ Targets: %d°C day, %d°C night, Mode: %s\n",
+                    (int)targets.tempTargetDay, (int)targets.tempTargetNight,
+                    targets.humidityMode);
+      
+      // ========================================
+      // Parse LIGHTING for this week
+      // ========================================
+      
+      JsonObject lightingObj = weekObj["lighting"];
+      LightingSchedule& lighting = plan.lighting;
+      
+      strlcpy(lighting.lightsOn, 
+              lightingObj["lightsOn"] | "06:00", 
+              sizeof(lighting.lightsOn));
+      strlcpy(lighting.lightsOff, 
+              lightingObj["lightsOff"] | "18:00", 
+              sizeof(lighting.lightsOff));
+      
+      // Parse PWM dimming schedule (0-10 points per day)
+      JsonArray scheduleArray = lightingObj["schedule"];
+      lighting.scheduleCount = 0;
+      
+      for (JsonObject schedPoint : scheduleArray) {
+        if (lighting.scheduleCount >= 10) break;
+        
+        PWMLightingPoint& point = lighting.schedule[lighting.scheduleCount];
+        
+        strlcpy(point.time, schedPoint["time"] | "06:00", sizeof(point.time));
+        point.brightness = schedPoint["brightness"] | 100;
+        
+        JsonObject channels = schedPoint["channels"];
+        point.ch1 = channels["ch1"] | 0;  // White (0-100%)
+        point.ch2 = channels["ch2"] | 0;  // Yellow (0-100%)
+        point.ch3 = channels["ch3"] | 0;  // Red (0-100%)
+        
+        lighting.scheduleCount++;
+      }
+      
+      if (lighting.scheduleCount > 0) {
+        Serial.printf("[AutoSync]     💡 Lighting: %s-%s, %d PWM points\n",
+                      lighting.lightsOn, lighting.lightsOff, 
+                      lighting.scheduleCount);
+      }
+      
+      // ========================================
+      // Parse EQUIPMENT for this week
+      // ========================================
+      
+      JsonObject equipObj = weekObj["equipment"];
+      EquipmentConfig& equipment = plan.equipment;
+      
+      strlcpy(equipment.fanCircMode, 
+              equipObj["fanCirculation"]["mode"] | "24H", 
+              sizeof(equipment.fanCircMode));
+      strlcpy(equipment.fanExhMode, 
+              equipObj["fanExhaust"]["mode"] | "24H", 
+              sizeof(equipment.fanExhMode));
+      strlcpy(equipment.acMode, 
+              equipObj["ac"]["mode"] | "OFF", 
+              sizeof(equipment.acMode));
+      equipment.acTargetTemp = equipObj["ac"]["targetTemp"] | 26.0;
+      strlcpy(equipment.acFanSpeed, 
+              equipObj["ac"]["fanSpeed"] | "AUTO", 
+              sizeof(equipment.acFanSpeed));
+      
+      Serial.printf("[AutoSync]     ⚙️  Equipment: FanCirc=%s, FanExh=%s, AC=%s\n",
+                    equipment.fanCircMode, equipment.fanExhMode, equipment.acMode);
+      
+      // ========================================
+      // Parse IRRIGATION for this week
+      // ========================================
+      
+      JsonArray irrArray = weekObj["irrigation"];
+      
+      // Store irrigation count for this week (optional, for UI display)
+      int weekIrrigationCount = 0;
+      for (JsonObject irrObj : irrArray) {
+        weekIrrigationCount++;
+      }
+      
+      if (weekIrrigationCount > 0) {
+        Serial.printf("[AutoSync]     💧 Irrigation: %d schedules\n", weekIrrigationCount);
+        
+        // Parse first irrigation of this week (if multiple, Cloud should consolidate)
+        if (irrArray.size() > 0) {
+          JsonObject firstIrr = irrArray[0];
+          // Store for this week's use
+          // (Full irrigation parsing happens at root level or per-week)
+        }
+      }
+      
+      // ========================================
+      // Add to flattened array (for compatibility)
+      // ========================================
+      
+      if (_weeklyPlanCount < MAX_WEEKLY_PLANS) {
+        _weeklyPlans[_weeklyPlanCount] = plan;
+        _weeklyPlanCount++;
+      }
+      
+      phase.weekCount++;
+      globalWeek++;
+    }
+    
+    phase.endGlobalWeek = globalWeek - 1;
+    
+    Serial.printf("[AutoSync] ✅ Phase %s: %d weeks (global weeks %d-%d)\n",
+                  phaseName, phase.weekCount, 
+                  phase.startGlobalWeek, phase.endGlobalWeek);
+    
+    _phaseCount++;
+  }
+  
+  Serial.printf("[AutoSync] ✅ Parsed %d phases, %d total weeks\n\n", 
+                _phaseCount, _weeklyPlanCount);
+  
+  return true;
+}
+
+// ============================================
+// UPDATE CURRENT WEEK INFO
+// ============================================
+
+void AutomationSync::updateCurrentWeekInfo() {
+  // Use currentWeek from JSON (Trust Cloud)
+  _currentWeek = _currentWeek;  // Already set by Cloud in parsePayload()
+  _currentWeekInPhase = 1;       // Will calculate below
+  
+  // Find which phase contains current week
+  for (int p = 0; p < _phaseCount; p++) {
+    const PhaseWeeks& phase = _phaseWeeks[p];
+    
+    if (_currentWeek >= phase.startGlobalWeek && 
+        _currentWeek <= phase.endGlobalWeek) {
+      
+      // Found the phase!
+      _currentWeekInPhase = _currentWeek - phase.startGlobalWeek + 1;
+      strlcpy(_currentPhase, phase.phaseName, sizeof(_currentPhase));
+      
+      Serial.printf("[AutoSync] 📍 Current Week: %s Week %d / %d (Global Week %d / %d)\n",
+                    phase.phaseName, _currentWeekInPhase, phase.weekCount,
+                    _currentWeek, _totalWeeks);
+      
+      return;
+    }
+  }
+  
+  // Fallback (shouldn't happen)
+  Serial.printf("[AutoSync] ⚠️  Current week %d out of range [1-%d]\n", 
+                _currentWeek, _totalWeeks);
+}
+
+// ============================================
+// GET CURRENT WEEK PLAN
+// ============================================
+
+const WeeklyPlan* AutomationSync::getCurrentWeekPlan() const {
+  // Return plan for current global week
+  if (_currentWeek >= 1 && _currentWeek <= _weeklyPlanCount) {
+    return &_weeklyPlans[_currentWeek - 1];
+  }
+  return nullptr;
+}
+
+// ============================================
+// GET CURRENT TARGETS (for sensor evaluation)
+// ============================================
+
+const EnvironmentTargets* AutomationSync::getCurrentTargets() const {
+  const WeeklyPlan* plan = getCurrentWeekPlan();
+  return plan ? &plan->targets : nullptr;
+}
+
+// ============================================
+// GET CURRENT LIGHTING SCHEDULE
+// ============================================
+
+const LightingSchedule* AutomationSync::getCurrentLightingSchedule() const {
+  const WeeklyPlan* plan = getCurrentWeekPlan();
+  return plan ? &plan->lighting : nullptr;
+}
+
+// ============================================
+// GET CURRENT EQUIPMENT CONFIG
+// ============================================
+
+const EquipmentConfig* AutomationSync::getCurrentEquipmentConfig() const {
+  const WeeklyPlan* plan = getCurrentWeekPlan();
+  return plan ? &plan->equipment : nullptr;
 }

@@ -95,6 +95,22 @@ void RelayController::setLight(bool state) {
     setRelay(RELAY_LIGHT, state);
 }
 
+void RelayController::setHumidifier(bool state) {
+    setRelay(RELAY_HUMIDIFIER, state);
+}
+
+void RelayController::setDehumidifier(bool state) {
+    setRelay(RELAY_DEHUMIDIFIER, state);
+}
+
+void RelayController::setCO2Valve(bool state) {
+    setRelay(RELAY_CO2_VALVE, state);
+}
+
+void RelayController::setPump(bool state) {
+    setRelay(RELAY_PUMP, state);
+}
+
 void RelayController::setFanCirculation(bool state) {
     setRelay(RELAY_FAN_CIRC, state);
 }
@@ -103,18 +119,8 @@ void RelayController::setFanExhaust(bool state) {
     setRelay(RELAY_FAN_EXHAUST, state);
 }
 
-void RelayController::setPump(uint8_t pumpNum, bool state) {
-    if (pumpNum >= 1 && pumpNum <= 3) {
-        setRelay(RELAY_PUMP_1 + pumpNum - 1, state);
-    }
-}
-
-void RelayController::setCO2Valve(bool state) {
-    setRelay(RELAY_CO2_VALVE, state);
-}
-
-void RelayController::setACTrigger(bool state) {
-    setRelay(RELAY_AC_TRIGGER, state);
+void RelayController::setOption(bool state) {
+    setRelay(RELAY_OPTION, state);
 }
 
 // Bulk control

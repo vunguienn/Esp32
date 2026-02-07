@@ -51,33 +51,48 @@
 // HARDWARE PIN DEFINITIONS (ESP32-S3)
 // ============================================================================
 
-// Digital Inputs (8 channels - Optocoupler isolated)
-#define DI_PIN_1    1
-#define DI_PIN_2    2
-#define DI_PIN_3    3
-#define DI_PIN_4    4
-#define DI_PIN_5    5
-#define DI_PIN_6    6
-#define DI_PIN_7    7
-#define DI_PIN_8    8
+// Digital Inputs (7 channels - Optocoupler isolated)
+// Note: DI_PIN_8 not available - IO8 is used for I2C SCL
+#define DI_PIN_1    1     // Input 1 - IN1
+#define DI_PIN_2    2     // Input 2 - IN2
+#define DI_PIN_3    3     // Input 3 - IN3
+#define DI_PIN_4    4     // Input 4 - IN4
+#define DI_PIN_5    5     // Input 5 - IN5
+#define DI_PIN_6    6     // Input 6 - IN6
+#define DI_PIN_7    7     // Input 7 - IN7
 
-// Digital Outputs / Relays (8 channels)
-#define DO_PIN_1    21    // Relay 1 - Light main
-#define DO_PIN_2    22    // Relay 2 - Fan circulation
-#define DO_PIN_3    23    // Relay 3 - Fan exhaust
-#define DO_PIN_4    24    // Relay 4 - Pump 1 (irrigation)
-#define DO_PIN_5    25    // Relay 5 - Pump 2
-#define DO_PIN_6    26    // Relay 6 - Pump 3
-#define DO_PIN_7    27    // Relay 7 - CO2 valve
-#define DO_PIN_8    28    // Relay 8 - AC trigger
+// Digital Outputs / Relays (8 channels) - From PCB Schematic ESP32-S3-1U-N4
+// OUT1-OUT8 mapping according to hardware design
+#define DO_PIN_1    20    // Relay 1 - Light (Đèn) - OUT1
+#define DO_PIN_2    19    // Relay 2 - Humidifier (Phun ẩm) - OUT2
+#define DO_PIN_3    21    // Relay 3 - Dehumidifier (Hút ẩm) - OUT3
+#define DO_PIN_4    42    // Relay 4 - CO2 valve - OUT4
+#define DO_PIN_5    41    // Relay 5 - Pump (Bơm tưới) - OUT5
+#define DO_PIN_6    40    // Relay 6 - Fan Circulation (Quạt thổi) - OUT6
+#define DO_PIN_7    39    // Relay 7 - Fan Exhaust (Quạt hút) - OUT7
+#define DO_PIN_8    38    // Relay 8 - Option (Tùy chọn) - OUT8
 
 // Relay active state (HIGH or LOW depending on relay module)
 // Low-trigger relay boards should use false
 #define RELAY_ACTIVE_HIGH   false
 
-// ADS1115 ADC (4 channels via I2C)
-#define I2C_SDA         9
-#define I2C_SCL         10
+// PWM Dimming for LED Lighting (3 channels)
+// NOTE: Relay CH1 (GPIO 20) controls main light ON/OFF
+// These PWM pins control brightness & color mixing 
+#define PWM_FREQ            5000      // 5 KHz
+#define PWM_RESOLUTION      8         // 8-bit resolution (0-255)
+#define PWM_CHANNEL_1       0         // LEDC channel for White
+#define PWM_CHANNEL_2       1         // LEDC channel for Yellow
+#define PWM_CHANNEL_3       2         // LEDC channel for Red
+// ⚠️ PWM GPIO pins depend on your LED driver hardware
+// If using relay module only, PWM dimming will be disabled
+#define PWM_CH1_PIN         20        // PWM for White LED
+#define PWM_CH2_PIN         34        // PWM for Yellow LED
+#define PWM_CH3_PIN         35        // PWM for Red LED
+
+// ADS1115 ADC (4 channels via I2C) - From PCB Schematic
+#define I2C_SDA         9     // IO9
+#define I2C_SCL         8     // IO8 (Changed from IO10)
 #define ADS1115_ADDR    0x48
 
 // RS485 Interface (GPIO 17,18 - tránh conflict với DI_PIN_7,8)

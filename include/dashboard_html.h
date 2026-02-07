@@ -146,6 +146,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f
 <div class="pg" id="pg-auto">
  <div class="gr">
   <div class="cd fw"><h2>📊 Automation Status</h2><div id="ad">Loading...</div></div>
+ <div class="cd fw"><h2>💧 Irrigation Schedules</h2><div id="ir">Loading...</div></div>
   <div class="cd fw"><h2>📅 Weekly Plans</h2><div id="wp" style="max-height:600px;overflow-y:auto">Loading...</div></div>
  </div>
 </div>
@@ -273,6 +274,24 @@ async function uAD(){
   });
  }else{w='<div style="text-align:center;color:#475569;padding:30px">No weekly plans — Send automation from Cloud first</div>';}
  document.getElementById('wp').innerHTML=w;
+ 
+ // Display irrigation schedules
+ let ir='';
+ if(d.irrigations&&d.irrigations.length>0){
+  d.irrigations.forEach(irg=>{
+   const st=irg.enabled?'bd-ok':'bd-er';
+   const ic=irg.enabled?'💧':'🚫';
+   ir+=`<div class="wb"><div class="wt">${ic} ${irg.name} <span class="bd ${st}">${irg.enabled?'ENABLED':'DISABLED'}</span></div><div class="wg">`+
+   `<div class="wi"><span>🕐Start:</span> <span>${irg.cycleStart}</span></div>`+
+   `<div class="wi"><span>🕐End:</span> <span>${irg.cycleEnd}</span></div>`+
+   `<div class="wi"><span>💦Pump:</span> <span>${irg.pumpDurationSec}s ON / ${irg.restDurationSec}s OFF</span></div>`+
+   `<div class="wi"><span>📅Days:</span> <span>${irg.activeDays.join(', ')}</span></div>`+
+   `<div class="wi"><span>🔌Relays:</span> <span>${irg.pumpRelays.join(', ')}</span></div>`+
+   `<div class="wi"><span>⚡Status:</span> <span style="color:${irg.pumpRunning?'#4ade80':'#64748b'}">${irg.pumpRunning?'🟢 RUNNING':'⚫ IDLE'}</span></div>`+
+   `</div></div>`;
+  });
+ }else{ir='<div style="text-align:center;color:#475569;padding:30px">No irrigation schedules</div>';}
+ document.getElementById('ir').innerHTML=ir;
 }
 
 async function uL(){

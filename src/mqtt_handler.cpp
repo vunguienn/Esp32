@@ -122,9 +122,15 @@ bool MQTTHandler::connect() {
     }
     _lastReconnectAttempt = now;
     
+    // CRITICAL: Set WiFiClient timeout to 15 seconds
+    // Default 3s timeout causes MQTT connection failure with 16KB buffer
+    // TCP handshake needs more time with large PubSubClient buffer
+    _wifiClient->setTimeout(15000);
+    
     String clientId = generateClientId();
     Serial.printf("[MQTT] 🔌 Connecting to %s:%d as %s...\n", 
                   _mqttServer.c_str(), _mqttPort, clientId.c_str());
+    Serial.println("[MQTT] ⏱️  Socket timeout: 15s (16KB buffer requires longer handshake)");
     
     bool connected = false;
     
@@ -199,11 +205,12 @@ void MQTTHandler::subscribeToTopics() {
         _mqttClient->subscribe(_topicControl, 0);
         Serial.printf("[MQTT] 📥 SUB: %s (QoS 0)\n", _topicControl);
         
-        // Subscribe to automation update topic
-        _mqttClient->subscribe(_topicAutomationUpdate, 0);
+        // Subscribe to automation update topic with QoS 1 (critical data)
+        _mqttClient->subscribe(_topicAutomationUpdate, 1);
         Serial.println("[MQTT] ========================================");
-        Serial.printf("[MQTT] 📥 SUBSCRIBED: %s (QoS 0)\n", _topicAutomationUpdate);
+        Serial.printf("[MQTT] 📥 SUBSCRIBED: %s (QoS 1 - Guaranteed)\n", _topicAutomationUpdate);
         Serial.println("[MQTT] ⚠️  CLOUD PHẢI GỬI CHÍNH XÁC TOPIC NÀY!");
+        Serial.println("[MQTT] 💡 QoS 1 đảm bảo delivery cho payload lớn!");
         Serial.println("[MQTT] ========================================");
     }
     
@@ -403,6 +410,43 @@ bool MQTTHandler::publishStatus(bool online, const char* ip, int rssi,
                      online ? "YES" : "NO", ip, rssi, freeHeap);
     }
     
+    return success;
+}
+
+bool MQTTHandler::publishLifecycleStatus(bool online, const char* ip, int rssi,
+                                         unsigned long uptime, uint32_t freeHeap,
+                                         int projectDay, int dayInWeek,
+                                         int currentWeek, int currentWeekInPhase,
+                                         const char* currentPhase) {
+    if (!isConnected()) {
+        return false;
+    }
+
+    JsonDocument doc;
+    doc["online"] = online;
+    doc["ip"] = ip;
+    doc["rssi"] = rssi;
+    doc["uptime"] = uptime;
+    doc["freeHeap"] = freeHeap;
+    doc["firmware"] = FIRMWARE_VERSION;
+
+    doc["projectDay"] = projectDay;
+    doc["dayInWeek"] = dayInWeek;
+    doc["currentWeek"] = currentWeek;
+    doc["currentWeekInPhase"] = currentWeekInPhase;
+    doc["currentPhase"] = currentPhase;
+
+    String output;
+    serializeJson(doc, output);
+
+    bool success = _mqttClient->publish(_topicStatus, output.c_str(), true);
+
+    if (success) {
+        Serial.printf("[MQTT] 📤 PUBLISH (lifecycle) to %s\n", _topicStatus);
+        Serial.printf("[MQTT] 📅 ProjectDay=%d DayInWeek=%d Week=%d Phase=%s\n",
+                      projectDay, dayInWeek, currentWeek, currentPhase);
+    }
+
     return success;
 }
 

@@ -43,6 +43,11 @@ public:
                           int waterLevel = 0, float vpd = 0);
     bool publishStatus(bool online, const char* ip, int rssi, 
                       unsigned long uptime, uint32_t freeHeap);
+    bool publishLifecycleStatus(bool online, const char* ip, int rssi,
+                                unsigned long uptime, uint32_t freeHeap,
+                                int projectDay, int dayInWeek,
+                                int currentWeek, int currentWeekInPhase,
+                                const char* currentPhase);
     bool publishCommandAck(const char* commandId, bool success, const char* message = nullptr);
     
     // Device verification

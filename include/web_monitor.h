@@ -85,12 +85,14 @@ private:
     void handleRoot();
     void handleApiStatus();
     void handleApiSensors();
+    void handleApiSensorMock();
     void handleApiRelays();
     void handleApiRelayToggle();   // Toggle relay from dashboard
     void handleApiInputs();        // Read digital inputs
     void handleApiAutomation();
     void handleApiAutomationFull();
     void handleApiAutomationCheck();
+    void handleApiLifecycleSet();
     void handleApiSystem();
     void handleApiWatchdog();
     void handleApiWatchdogReset();

@@ -52,11 +52,23 @@ struct EnvironmentTargets {
   int co2StopNight;
   float vpdMin;
   float vpdMax;
+  char humidityMode[12];  // HUMIDIFY, DEHUMIDIFY
+};
+
+// PWM Lighting schedule point (JSON v8)
+struct PWMLightingPoint {
+  char time[6];           // "HH:mm"
+  int brightness;         // 0-100%
+  int ch1;                // White channel (0-100%)
+  int ch2;                // Yellow channel (0-100%)
+  int ch3;                // Red channel (0-100%)
 };
 
 struct LightingSchedule {
-  char lightsOn[6];   // "HH:mm"
+  char lightsOn[6];        // "HH:mm"
   char lightsOff[6];
+  PWMLightingPoint schedule[10];  // Max 10 dimming points per day
+  int scheduleCount;
 };
 
 struct EquipmentConfig {
@@ -81,11 +93,21 @@ struct EquipmentConfig {
 
 // Weekly plan structure (for multi-week support)
 struct WeeklyPlan {
-  int week;
-  char phase[20];         // Seedling, Veg, Flower, etc.
+  int week;                       // Week number within phase (1-8)
+  int globalWeek;                 // Global week number (1-16)
+  char phase[20];                 // SEEDING, VEG, FLOWER, HARVEST
   EnvironmentTargets targets;
   LightingSchedule lighting;
   EquipmentConfig equipment;
+};
+
+// Phase-based weekly plans (JSON v8 structure)
+struct PhaseWeeks {
+  char phaseName[20];             // "SEEDING", "VEG", "FLOWER", "HARVEST"
+  WeeklyPlan weeks[10];           // Each phase can have up to 10 weeks
+  int weekCount;                  // Number of weeks in this phase
+  int startGlobalWeek;            // Starting global week for this phase
+  int endGlobalWeek;              // Ending global week for this phase
 };
 
 struct AutomationTrigger {
@@ -238,6 +260,34 @@ public:
    * Check if automation is loaded
    */
   bool isLoaded() const { return _loaded; }
+
+  /**
+   * Set sensor override values for testing
+   */
+  void setSensorOverride(float temp, float humi, float co2, float vpd);
+
+  /**
+   * Clear sensor override and use real sensor values
+   */
+  void clearSensorOverride();
+
+  /**
+   * Check if sensor override is enabled
+   */
+  bool isSensorOverrideEnabled() const { return _sensorOverrideEnabled; }
+
+  /**
+   * Check if automation is allowed by license
+   */
+  bool isAutomationAllowed() const;
+
+  /**
+   * Get license status
+   */
+  bool isLicenseActive() const { return _licenseActive; }
+  unsigned long getLicenseExpiresAt() const { return _licenseExpiresAt; }
+  int getOfflineGraceDays() const { return _offlineGraceDays; }
+  unsigned long getLastCloudSync() const { return _lastCloudSync; }
   
   /**
    * Get rule count
@@ -262,14 +312,54 @@ public:
    * Get calculated current week (from plantStartDate)
    */
   int getCurrentWeek() const { return _currentWeek; }
+
+  /**
+   * Get current day within week (1-7)
+   */
+  int getCurrentDayInWeek() const { return _currentDay; }
+
+  /**
+   * Get current project day (1..N) since plant start
+   */
+  int getProjectDay() const { return _currentProjectDay; }
+
+  /**
+   * Set lifecycle override (project day, week, phase)
+   */
+  bool setLifecycleOverride(int projectDay, int currentWeek, const char* phaseName);
+
+  /**
+   * Clear lifecycle override and return to auto calculation
+   */
+  bool clearLifecycleOverride();
+
+  /**
+   * Check if lifecycle override is enabled
+   */
+  bool isLifecycleOverrideEnabled() const { return _lifecycleOverrideEnabled; }
   
   /**
-   * Get current phase name
+   * Get current week within phase (e.g., Week 2 of FLOWER)
+   */
+  int getCurrentWeekInPhase() const { return _currentWeekInPhase; }
+  
+  /**
+   * Get current phase name (SEEDING, VEG, FLOWER, HARVEST)
    */
   const char* getCurrentPhase() const { return _currentPhase; }
   
   /**
-   * Get all weekly plans
+   * Get all phase-based weekly plans (JSON v8 structure)
+   */
+  const PhaseWeeks* getPhaseWeeks() const { return _phaseWeeks; }
+  
+  /**
+   * Get number of phases
+   */
+  int getPhaseCount() const { return _phaseCount; }
+  
+  /**
+   * Get all weekly plans (flattened array for compatibility)
    */
   const WeeklyPlan* getWeeklyPlans() const { return _weeklyPlans; }
   int getWeeklyPlanCount() const { return _weeklyPlanCount; }
@@ -293,6 +383,48 @@ public:
    * Get timezone name
    */
   const char* getTimezoneName() const { return _timezoneName; }
+  
+  /**
+   * Get current week's plan (with targets, lighting, equipment)
+   */
+  const WeeklyPlan* getCurrentWeekPlan() const;
+  
+  /**
+   * Get current week's environment targets
+   */
+  const EnvironmentTargets* getCurrentTargets() const;
+  
+  /**
+   * Get current week's lighting schedule
+   */
+  const LightingSchedule* getCurrentLightingSchedule() const;
+  
+  /**
+   * Get current week's equipment config
+   */
+  const EquipmentConfig* getCurrentEquipmentConfig() const;
+  
+  /**
+   * Get current phase's week count
+   */
+  int getPhaseWeekCount() const {
+    for (int i = 0; i < _phaseCount; i++) {
+      if (strcmp(_phaseWeeks[i].phaseName, _currentPhase) == 0) {
+        return _phaseWeeks[i].weekCount;
+      }
+    }
+    return 0;
+  }
+  
+  /**
+   * Get irrigation schedules array
+   */
+  const IrrigationConfig* getIrrigations() const { return _irrigation; }
+  
+  /**
+   * Get irrigation schedules count
+   */
+  int getIrrigationCount() const { return _irrigationCount; }
   
   /**
    * Get local time (UTC + timezone offset)
@@ -325,11 +457,38 @@ private:
   // Plant lifecycle
   unsigned long _plantStartTimestamp;  // Unix timestamp of plant start
   int _totalWeeks;
-  int _currentWeek;                    // Calculated from plantStartDate
+  int _currentWeek;                    // Global week number (1-16)
+  int _currentWeekInPhase;             // Week within current phase (1-8)
   int _currentDay;                     // Day within current week (1-7)
-  char _currentPhase[20];
+  int _currentProjectDay;              // Day since plant start (1..N)
+  char _currentPhase[20];              // SEEDING, VEG, FLOWER, HARVEST
+
+  // Lifecycle override (manual edit)
+  bool _lifecycleOverrideEnabled;
+  unsigned long _lifecycleBaseTimestamp;
+  int _lifecycleBaseProjectDay;
+  int _lifecycleBaseWeek;
+  int _lifecycleBaseDayInWeek;
+  char _lifecyclePhaseOverride[20];
+
+  // Sensor override (testing)
+  bool _sensorOverrideEnabled;
+  float _sensorOverrideTemp;
+  float _sensorOverrideHumi;
+  float _sensorOverrideCo2;
+  float _sensorOverrideVpd;
+
+  // License state (from Cloud)
+  bool _licenseActive;
+  unsigned long _licenseExpiresAt;
+  unsigned long _lastCloudSync;
+  int _offlineGraceDays;
   
-  // Weekly plans (all weeks)
+  // Phase-based weekly plans (JSON v8 nested structure)
+  PhaseWeeks _phaseWeeks[4];           // Max 4 phases: SEEDING, VEG, FLOWER, HARVEST
+  int _phaseCount;
+  
+  // Weekly plans (flattened array for compatibility)
   WeeklyPlan _weeklyPlans[MAX_WEEKLY_PLANS];
   int _weeklyPlanCount;
   
@@ -367,6 +526,9 @@ private:
   
   // Private methods
   bool parsePayload(const char* jsonData);
+  bool parseNestedWeeklyPlans(JsonObject weeklyPlansObj);
+  void updateCurrentWeekInfo();
+  
   bool saveToSPIFFS(const char* jsonData);
   String loadFromSPIFFS();
   String calculateMD5(const char* data);
@@ -392,6 +554,12 @@ private:
   // Week calculation
   void calculateCurrentWeek();
   void selectWeeklyPlan(int week);
+  void loadLifecycleOverride();
+  void saveLifecycleOverride();
+  void applyLifecycleOverride();
+  void loadLicenseState();
+  void saveLicenseState();
+  void resetLifecycleForNewLicense();
   bool parseWeeklyPlans(JsonArray& plans);
 };
 

@@ -411,6 +411,50 @@ void loop() {
             
             // Run custom automation rules
             automationSync.runRules();
+
+            // Publish lifecycle status when day/week changes
+            static int lastProjectDay = -1;
+            static int lastDayInWeek = -1;
+            static int lastWeek = -1;
+            static int lastWeekInPhase = -1;
+            static char lastPhase[20] = "";
+            
+            int projectDay = automationSync.getProjectDay();
+            int dayInWeek = automationSync.getCurrentDayInWeek();
+            int currentWeek = automationSync.getCurrentWeek();
+            int currentWeekInPhase = automationSync.getCurrentWeekInPhase();
+            const char* currentPhase = automationSync.getCurrentPhase();
+            
+            if (mqttHandler.isConnected()) {
+                bool changed = projectDay != lastProjectDay ||
+                               dayInWeek != lastDayInWeek ||
+                               currentWeek != lastWeek ||
+                               currentWeekInPhase != lastWeekInPhase ||
+                               strcmp(currentPhase, lastPhase) != 0;
+                
+                if (changed) {
+                    bool published = mqttHandler.publishLifecycleStatus(
+                        true,
+                        wifiManager.getIP().c_str(),
+                        wifiManager.getRSSI(),
+                        millis() / 1000,
+                        ESP.getFreeHeap(),
+                        projectDay,
+                        dayInWeek,
+                        currentWeek,
+                        currentWeekInPhase,
+                        currentPhase
+                    );
+                    
+                    if (published) {
+                        lastProjectDay = projectDay;
+                        lastDayInWeek = dayInWeek;
+                        lastWeek = currentWeek;
+                        lastWeekInPhase = currentWeekInPhase;
+                        strlcpy(lastPhase, currentPhase, sizeof(lastPhase));
+                    }
+                }
+            }
             
             // Check irrigation EVERY SECOND (for short pump durations like 10s)
             automationSync.checkIrrigationSchedules();

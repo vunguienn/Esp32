@@ -12,24 +12,24 @@
 // Relay names for clarity
 enum RelayChannel {
     RELAY_LIGHT = 1,        // Main grow light
-    RELAY_FAN_CIRC = 2,     // Circulation fan
-    RELAY_FAN_EXHAUST = 3,  // Exhaust fan
-    RELAY_PUMP_1 = 4,       // Irrigation pump 1
-    RELAY_PUMP_2 = 5,       // Irrigation pump 2
-    RELAY_PUMP_3 = 6,       // Irrigation pump 3
-    RELAY_CO2_VALVE = 7,    // CO2 solenoid valve
-    RELAY_AC_TRIGGER = 8    // AC control trigger
+    RELAY_HUMIDIFIER = 2,   // Humidifier (Phun ẩm)
+    RELAY_DEHUMIDIFIER = 3, // Dehumidifier (Hút ẩm)
+    RELAY_CO2_VALVE = 4,    // CO2 solenoid valve
+    RELAY_PUMP = 5,         // Irrigation pump
+    RELAY_FAN_CIRC = 6,     // Circulation fan (Quạt thổi)
+    RELAY_FAN_EXHAUST = 7,  // Exhaust fan (Quạt Hút)
+    RELAY_OPTION = 8        // Optional device
 };
 
 struct RelayStates {
     bool relay1;  // Light
-    bool relay2;  // Fan circulation
-    bool relay3;  // Fan exhaust
-    bool relay4;  // Pump 1
-    bool relay5;  // Pump 2
-    bool relay6;  // Pump 3
-    bool relay7;  // CO2
-    bool relay8;  // AC
+    bool relay2;  // Humidifier (Phun ẩm)
+    bool relay3;  // Dehumidifier (Hút ẩm)
+    bool relay4;  // CO2
+    bool relay5;  // Pump
+    bool relay6;  // Fan Circulation (Quạt thổi)
+    bool relay7;  // Fan Exhaust (Quạt Hút)
+    bool relay8;  // Option
 };
 
 class RelayController {
@@ -46,11 +46,13 @@ public:
     
     // Control by name
     void setLight(bool state);
+    void setHumidifier(bool state);
+    void setDehumidifier(bool state);
+    void setCO2Valve(bool state);
+    void setPump(bool state);
     void setFanCirculation(bool state);
     void setFanExhaust(bool state);
-    void setPump(uint8_t pumpNum, bool state);
-    void setCO2Valve(bool state);
-    void setACTrigger(bool state);
+    void setOption(bool state);
     
     // Bulk control
     void setAllRelays(bool state);
